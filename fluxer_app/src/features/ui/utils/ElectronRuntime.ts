@@ -13,6 +13,13 @@ export function isElectron(): boolean {
 	);
 }
 
+// Electron's default user agent carries the app name with its spaces removed,
+// so Fluxer Desktop's says Fluxer/, FluxerCanary/ or FluxerDevelopment/.
+// Other Electron apps that embed the web app, such as a preview pane, have
+// no desktop bridge either and must not count as a broken installation.
+const FLUXER_DESKTOP_USER_AGENT = /\bFluxer(?:Canary|Development)?\/\S/;
+const ELECTRON_USER_AGENT = /\bElectron\/\d+(?:\.\d+)*/;
+
 export function hasUnavailableElectronNativeContext(): boolean {
 	if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
 	return (
@@ -20,6 +27,8 @@ export function hasUnavailableElectronNativeContext(): boolean {
 			window as {
 				electron?: ElectronAPI | null;
 			}
-		).electron == null && /\bElectron\/\d+(?:\.\d+)*/.test(navigator.userAgent)
+		).electron == null &&
+		ELECTRON_USER_AGENT.test(navigator.userAgent) &&
+		FLUXER_DESKTOP_USER_AGENT.test(navigator.userAgent)
 	);
 }
