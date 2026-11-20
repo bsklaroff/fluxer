@@ -1,0 +1,97 @@
+# Dockerfile.yaac for fluxer: pre-installs what `make toolchain native-deps`
+# would, so in a workspace those steps finish in seconds before `make dist`.
+#
+# - apt build deps from tools/dist/toolchain.sh, plus libncurses-dev for OTP
+# - PostgreSQL 17 from PGDG (Ubuntu 26.04 only ships 18; fluxerd pins 17)
+# - Fluxer's pinned toolchain (Rust, Node, pnpm, Go, Erlang/OTP, rebar3) in
+#   /opt/fluxer/toolchain, built by the repo's own tools/dist/toolchain.sh
+# - FFmpeg + libheif in /opt/fluxer/native, built by the repo's own
+#   fluxer_media_proxy/tools/install-native-deps.sh
+#
+# The build context is yaac's per-project build dir, not the repo, so the two
+# scripts are fetched from GitHub at FLUXER_REF.
+#
+# The image is only a warm cache: both scripts are incremental, so building any
+# Fluxer commit should still start with `make toolchain native-deps`, which is a
+# quick no-op when the pins match and only rebuilds the component that changed
+# otherwise. Bump FLUXER_REF when the pins move (rare) to keep that step fast.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+
+USER root
+
+# Build deps (toolchain.sh APT_PACKAGES + OTP_APT_PACKAGES) and runtime libs
+# that fluxerd's children load (packaging/runtime-packages, Ubuntu names).
+# aom-tools and libwebm-dev are Ubuntu-only extras: Ubuntu's libaom-dev CMake
+# config references /usr/bin/aomdec and links -lwebm, which libheif's build
+# trips over without them (Debian's libaom-dev doesn't).
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential pkg-config cmake nasm yasm git curl ca-certificates xz-utils zstd \
+        python3 brotli clang llvm unzip \
+        libssl-dev zlib1g-dev libcurl4-openssl-dev \
+        libvips-dev libwebp-dev liblcms2-dev libyuv-dev libde265-dev libdav1d-dev libaom-dev \
+        libncurses-dev libjemalloc2 \
+        aom-tools libwebm-dev \
+        postgresql-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# PostgreSQL 17 from PGDG. fluxerd runs its own cluster under its data dir, so
+# stop the package from creating and starting a system "main" cluster.
+RUN sed -ri 's/^#?[[:space:]]*create_main_cluster[[:space:]]*=.*/create_main_cluster = false/' \
+        /etc/postgresql-common/createcluster.conf \
+    && grep -q '^create_main_cluster = false$' /etc/postgresql-common/createcluster.conf \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        https://apt.postgresql.org/pub/repos/apt/ACCC4CF8.asc \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-17 \
+    && rm -rf /var/lib/apt/lists/* \
+    && test -x /usr/lib/postgresql/17/bin/postgres
+
+# The pod may run as another uid in group 0, so everything here is yaac:0 and
+# group-writable (cargo writes its registry cache under the toolchain).
+RUN install -d -o yaac -g 0 -m 2775 /opt/fluxer /opt/fluxer/src
+
+USER yaac
+
+# Declared here, not at the top: every RUN after an ARG sees it, so a new
+# FLUXER_REF would otherwise invalidate the apt and Postgres layers too.
+ARG FLUXER_REPO=fluxerapp/fluxer
+ARG FLUXER_REF=6c133ffab4d1c3c6168cb451ab79be7f33818c92
+
+RUN umask 002 \
+    && base="https://raw.githubusercontent.com/${FLUXER_REPO}/${FLUXER_REF}" \
+    && curl -fsSL -o /opt/fluxer/src/toolchain.sh "$base/tools/dist/toolchain.sh" \
+    && curl -fsSL -o /opt/fluxer/src/install-native-deps.sh "$base/fluxer_media_proxy/tools/install-native-deps.sh" \
+    && chmod 0775 /opt/fluxer/src/*.sh
+
+# Some steps (OTP's and FFmpeg's configure) go quiet for minutes; the yaac
+# builder kills a step after 10 idle minutes, so print a heartbeat meanwhile.
+RUN umask 002; \
+    (while sleep 120; do echo "[heartbeat] toolchain still building"; done) & hb=$!; \
+    trap 'kill $hb 2>/dev/null || true' EXIT; \
+    JOBS="$(( $(nproc) < 8 ? $(nproc) : 8 ))" /opt/fluxer/src/toolchain.sh /opt/fluxer/toolchain; \
+    chmod -R g+rwX /opt/fluxer/toolchain/cargo /opt/fluxer/toolchain/rustup
+
+RUN umask 002; \
+    (while sleep 120; do echo "[heartbeat] native deps still building"; done) & hb=$!; \
+    trap 'kill $hb 2>/dev/null || true' EXIT; \
+    /opt/fluxer/src/install-native-deps.sh /opt/fluxer/native; \
+    test -f /opt/fluxer/native/lib/pkgconfig/libheif.pc
+
+# `make dist` reads TOOLCHAIN and NATIVE (Makefile `?=` defaults) and passes
+# them on to tools/dist/build.sh as FLUXER_TOOLCHAIN / FLUXER_NATIVE_PREFIX.
+# The toolchain is deliberately not put on PATH: the base image's rustup in
+# /usr/local stays the default for everyday cargo use.
+ENV TOOLCHAIN=/opt/fluxer/toolchain \
+    NATIVE=/opt/fluxer/native \
+    FLUXER_TOOLCHAIN=/opt/fluxer/toolchain \
+    FLUXER_NATIVE_PREFIX=/opt/fluxer/native \
+    FLUXER_POSTGRES_BIN_DIR=/usr/lib/postgresql/17/bin

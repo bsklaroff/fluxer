@@ -1,0 +1,9 @@
+{
+  "build": { "run": ".yaac/site/build.sh" },
+  "serve": {
+    "run": ".yaac/site/serve.sh",
+    "service": true,
+    "needs": ["build"],
+    "ready": ".yaac/site/serve.sh health"
+  }
+}
